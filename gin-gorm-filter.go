@@ -81,7 +81,8 @@ func searchField(field reflect.StructField, phrase string) clause.Expression {
 	columnName := getColumnNameForField(field)
 	if strings.Contains(filterTag, "searchable") {
 		return clause.Like{
-			Column: clause.Expr{SQL: "LOWER(?)", Vars: []interface{}{columnName}},
+//			Column: clause.Expr{SQL: "LOWER(?)", Vars: []interface{}{columnName}},
+			Column: columnName,
 			Value:  "%" + strings.ToLower(phrase) + "%",
 		}
 	}
