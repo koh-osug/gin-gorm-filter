@@ -80,6 +80,7 @@ type field struct {
 	param      string // name in the query: the `param:` option, or else the column name
 	column     string
 	dataType   schema.DataType
+	bits       int // bit size of an integer or float column, 64 when unknown
 	searchable bool
 	filterable bool
 	sortable   bool
@@ -119,10 +120,15 @@ func modelFields(db *gorm.DB, model interface{}) ([]field, error) {
 		if param == "" {
 			param = f.DBName
 		}
+		bits := f.Size
+		if bits <= 0 || bits > 64 {
+			bits = 64
+		}
 		fields = append(fields, field{
 			param:      param,
 			column:     f.DBName,
 			dataType:   f.DataType,
+			bits:       bits,
 			searchable: opts["searchable"] && f.DataType == schema.String,
 			filterable: opts["filterable"],
 			// Filtering with < and > already compares values, so sorting by a filterable
@@ -231,17 +237,20 @@ func paginate(db *gorm.DB, params queryParams) error {
 	return nil
 }
 
-// value converts a filter value to the type of the column, so that a wrong value is refused here
-// instead of failing in the database.
+// value converts a filter value to the type of the column, so that a wrong value or one out of
+// the column's range is refused here instead of failing in the database.
 func value(f field, raw string) (interface{}, error) {
 	switch f.dataType {
 	case schema.Bool:
 		return strconv.ParseBool(raw)
 	case schema.Int:
-		return strconv.ParseInt(raw, 10, 64)
+		return strconv.ParseInt(raw, 10, f.bits)
 	case schema.Uint:
-		return strconv.ParseUint(raw, 10, 64)
+		return strconv.ParseUint(raw, 10, f.bits)
 	case schema.Float:
+		if f.bits == 32 {
+			return strconv.ParseFloat(raw, 32)
+		}
 		return strconv.ParseFloat(raw, 64)
 	case schema.Time:
 		if t, err := time.Parse(time.RFC3339Nano, raw); err == nil {

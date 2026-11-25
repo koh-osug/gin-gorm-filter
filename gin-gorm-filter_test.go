@@ -35,6 +35,7 @@ type User struct {
 	Email    string `filter:"filterable"`
 	Age      int    `filter:"filterable"`
 	Active   bool   `filter:"searchable,filterable"`
+	Level    uint8  `filter:"filterable"`
 	GroupID  *uint  `filter:"filterable"`
 	// Not exposed.
 	Password string
@@ -46,7 +47,7 @@ type Group struct {
 	Name string
 }
 
-var userColumns = []string{"id", "created_at", "updated_at", "username", "name", "email", "age", "active", "group_id", "password"}
+var userColumns = []string{"id", "created_at", "updated_at", "username", "name", "email", "age", "active", "level", "group_id", "password"}
 
 type TestSuite struct {
 	suite.Suite
@@ -143,6 +144,7 @@ func (s *TestSuite) TestFilterOperators() {
 func (s *TestSuite) TestFilterTypedValues() {
 	s.expect("filter=active:true", FILTER, `^SELECT \* FROM "users" WHERE "active" = \$1$`, true)
 	s.expect("filter=group_id:7", FILTER, `^SELECT \* FROM "users" WHERE "group_id" = \$1$`, uint64(7))
+	s.expect("filter=level:255", FILTER, `^SELECT \* FROM "users" WHERE "level" = \$1$`, uint64(255))
 }
 
 func (s *TestSuite) TestFilterSeveralConditions() {
@@ -163,6 +165,7 @@ func (s *TestSuite) TestFilterRefused() {
 		"filter=group_id:-1",        // not a uint
 		"filter=active:maybe",       // not a bool
 		"filter=age~1",              // LIKE on a number
+		"filter=level:256",          // out of range for uint8
 		"filter=login",              // no operator
 		"filter=login:a,password:b", // one bad condition fails all
 		"filter=x login:a",          // not a column name
@@ -225,8 +228,8 @@ func (s *TestSuite) TestColumnsOf() {
 	c, err := ColumnsOf(s.db, &User{})
 	s.NoError(err)
 	s.Equal([]string{"login", "name"}, c.Searchable)
-	s.Equal([]string{"active", "age", "email", "group_id", "login"}, c.Filterable)
-	s.Equal([]string{"active", "age", "created_at", "email", "group_id", "id", "login"}, c.Sortable)
+	s.Equal([]string{"active", "age", "email", "group_id", "level", "login"}, c.Filterable)
+	s.Equal([]string{"active", "age", "created_at", "email", "group_id", "id", "level", "login"}, c.Sortable)
 }
 
 func TestRunSuite(t *testing.T) {
