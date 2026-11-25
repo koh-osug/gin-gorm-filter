@@ -7,9 +7,12 @@ package filter
 
 import (
 	"database/sql"
+	"database/sql/driver"
+	"errors"
 	"net/http"
 	"net/url"
 	"testing"
+	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
@@ -19,14 +22,31 @@ import (
 	"gorm.io/gorm"
 )
 
-type User struct {
-	Id       int64  `filter:"param:id;filterable"`
-	Username string `filter:"param:login;searchable;filterable"`
-	FullName string `filter:"param:name;searchable"`
-	Email    string `filter:"filterable"`
-	// This field is not filtered.
-	Password string
+type Base struct {
+	ID        uint      `gorm:"primarykey"`
+	CreatedAt time.Time `filter:"sortable"`
+	UpdatedAt time.Time
 }
+
+type User struct {
+	Base
+	Username string `filter:"param:login;searchable;filterable"`
+	FullName string `gorm:"column:name" filter:"searchable"`
+	Email    string `filter:"filterable"`
+	Age      int    `filter:"filterable"`
+	Active   bool   `filter:"searchable,filterable"`
+	GroupID  *uint  `filter:"filterable"`
+	// Not exposed.
+	Password string
+	Group    *Group
+}
+
+type Group struct {
+	ID   uint
+	Name string
+}
+
+var userColumns = []string{"id", "created_at", "updated_at", "username", "name", "email", "age", "active", "group_id", "password"}
 
 type TestSuite struct {
 	suite.Suite
@@ -42,8 +62,6 @@ func (s *TestSuite) SetupTest() {
 
 	db, s.mock, err = sqlmock.New()
 	s.NoError(err)
-	s.NotNil(db)
-	s.NotNil(s.mock)
 
 	dialector := postgres.New(postgres.Config{
 		DSN:                  "sqlmock_db_0",
@@ -54,241 +72,161 @@ func (s *TestSuite) SetupTest() {
 
 	s.db, err = gorm.Open(dialector, &gorm.Config{})
 	require.NoError(s.T(), err)
-	require.NotNil(s.T(), s.db)
 }
 
 func (s *TestSuite) TearDownTest() {
+	s.NoError(s.mock.ExpectationsWereMet())
 	db, err := s.db.DB()
 	require.NoError(s.T(), err)
 	db.Close()
 }
 
-// TestFiltersBasic is a test for basic filters functionality.
-func (s *TestSuite) TestFiltersBasic() {
-	var users []User
-	ctx := gin.Context{}
-	ctx.Request = &http.Request{
-		URL: &url.URL{
-			RawQuery: "filter=login:sampleUser",
-		},
-	}
-
-	s.mock.ExpectQuery(`^SELECT \* FROM "users" WHERE "Username" = \$1 ORDER BY "id" DESC LIMIT \$2$`).
-		WithArgs("sampleUser", 10).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "Username", "FullName", "Email", "Password"}))
-	err := s.db.Model(&User{}).Scopes(FilterByQuery(&ctx, ALL)).Find(&users).Error
-	s.NoError(err)
+func context(rawQuery string) *gin.Context {
+	return &gin.Context{Request: &http.Request{URL: &url.URL{RawQuery: rawQuery}}}
 }
 
-// TestFiltersBasic is a test for basic filters functionality.
-func (s *TestSuite) TestFiltersLike() {
+// expect runs the query for rawQuery and checks the SQL and its arguments.
+func (s *TestSuite) expect(rawQuery string, config int, sqlRegexp string, args ...interface{}) {
 	var users []User
-	ctx := gin.Context{}
-	ctx.Request = &http.Request{
-		URL: &url.URL{
-			RawQuery: "filter=login~samp",
-		},
+	query := s.mock.ExpectQuery(sqlRegexp)
+	if len(args) > 0 {
+		query = query.WithArgs(toDriverValues(args)...)
 	}
-
-	s.mock.ExpectQuery(`^SELECT \* FROM "users" WHERE "Username" LIKE \$1 ORDER BY "id" DESC LIMIT \$2$`).
-		WithArgs("samp", 10).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "Username", "FullName", "Email", "Password"}))
-	err := s.db.Model(&User{}).Scopes(FilterByQuery(&ctx, ALL)).Find(&users).Error
-	s.NoError(err)
+	query.WillReturnRows(sqlmock.NewRows(userColumns))
+	err := s.db.Model(&User{}).Scopes(FilterByQuery(context(rawQuery), config)).Find(&users).Error
+	s.NoError(err, rawQuery)
 }
 
-// Filtering for a field that is not filtered should not be performed
-func (s *TestSuite) TestFiltersNotFilterable() {
+// refuse runs the query for rawQuery and checks that it fails with ErrInvalidQuery without
+// reaching the database.
+func (s *TestSuite) refuse(rawQuery string, config int) {
 	var users []User
-	ctx := gin.Context{}
-	ctx.Request = &http.Request{
-		URL: &url.URL{
-			RawQuery: "filter=password:samplePassword",
-		},
-	}
-	s.mock.ExpectQuery(`^SELECT \* FROM "users"$`).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "Username", "FullName", "Email", "Password"}))
-	err := s.db.Model(&User{}).Scopes(FilterByQuery(&ctx, FILTER)).Find(&users).Error
-	s.NoError(err)
+	err := s.db.Model(&User{}).Scopes(FilterByQuery(context(rawQuery), config)).Find(&users).Error
+	s.Error(err, rawQuery)
+	s.True(errors.Is(err, ErrInvalidQuery), "%s: %v", rawQuery, err)
+	var qe *QueryError
+	s.True(errors.As(err, &qe), rawQuery)
 }
 
-// Filtering would not be applied if no config is provided.
-func (s *TestSuite) TestFiltersNoFilterConfig() {
-	var users []User
-	ctx := gin.Context{}
-	ctx.Request = &http.Request{
-		URL: &url.URL{
-			RawQuery: "filter=login:sampleUser",
-		},
+func toDriverValues(args []interface{}) []driver.Value {
+	out := make([]driver.Value, len(args))
+	for i, a := range args {
+		out[i] = a
 	}
-
-	s.mock.ExpectQuery(`^SELECT \* FROM "users"$`).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "Username", "FullName", "Email", "Password"}))
-	err := s.db.Model(&User{}).Scopes(FilterByQuery(&ctx, SEARCH)).Find(&users).Error
-	s.NoError(err)
+	return out
 }
 
-// Filtering would not be applied if no config is provided.
-func (s *TestSuite) TestFiltersNotEqualTo() {
-	var users []User
-	ctx := gin.Context{}
-	ctx.Request = &http.Request{
-		URL: &url.URL{
-			RawQuery: "filter=id!=22",
-		},
-	}
-
-	s.mock.ExpectQuery(`^SELECT \* FROM "users" WHERE "Id" <> \$1`).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "Username", "FullName", "Email", "Password"}))
-	err := s.db.Model(&User{}).Scopes(FilterByQuery(&ctx, FILTER)).Find(&users).Error
-	s.NoError(err)
+func (s *TestSuite) TestFilterEqual() {
+	s.expect("filter=login:sampleUser", ALL,
+		`^SELECT \* FROM "users" WHERE "username" = \$1 ORDER BY "id" DESC LIMIT \$2$`,
+		"sampleUser", 10)
 }
 
-func (s *TestSuite) TestFiltersLessThan() {
-	var users []User
-	ctx := gin.Context{}
-	ctx.Request = &http.Request{
-		URL: &url.URL{
-			RawQuery: "filter=login<Phil",
-		},
-	}
-
-	s.mock.ExpectQuery(`^SELECT \* FROM "users" WHERE "Username" < \$1`).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "Username", "FullName", "Email", "Password"}))
-	err := s.db.Model(&User{}).Scopes(FilterByQuery(&ctx, FILTER)).Find(&users).Error
-	s.NoError(err)
+func (s *TestSuite) TestFilterByColumnName() {
+	s.expect("filter=username:sampleUser", FILTER,
+		`^SELECT \* FROM "users" WHERE "username" = \$1$`, "sampleUser")
 }
 
-// Filtering would not be applied if no config is provided.
-func (s *TestSuite) TestFiltersLessThanOrEqualTo() {
-	var users []User
-	ctx := gin.Context{}
-	ctx.Request = &http.Request{
-		URL: &url.URL{
-			RawQuery: "filter=id<=200",
-		},
-	}
-
-	s.mock.ExpectQuery(`^SELECT \* FROM "users" WHERE "Id" <= \$1`).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "Username", "FullName", "Email", "Password"}))
-	err := s.db.Model(&User{}).Scopes(FilterByQuery(&ctx, FILTER)).Find(&users).Error
-	s.NoError(err)
+func (s *TestSuite) TestFilterLike() {
+	s.expect("filter=login~samp", FILTER,
+		`^SELECT \* FROM "users" WHERE "username" LIKE \$1$`, "samp")
 }
 
-func (s *TestSuite) TestFiltersGreaterThan() {
-	var users []User
-	ctx := gin.Context{}
-	ctx.Request = &http.Request{
-		URL: &url.URL{
-			RawQuery: "filter=id>100",
-		},
-	}
-
-	s.mock.ExpectQuery(`^SELECT \* FROM "users" WHERE "Id" > \$1`).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "Username", "FullName", "Email", "Password"}))
-	err := s.db.Model(&User{}).Scopes(FilterByQuery(&ctx, FILTER)).Find(&users).Error
-	s.NoError(err)
+func (s *TestSuite) TestFilterOperators() {
+	s.expect("filter=age!=22", FILTER, `^SELECT \* FROM "users" WHERE "age" <> \$1$`, int64(22))
+	s.expect("filter=age<=200", FILTER, `^SELECT \* FROM "users" WHERE "age" <= \$1$`, int64(200))
+	s.expect("filter=age>=99", FILTER, `^SELECT \* FROM "users" WHERE "age" >= \$1$`, int64(99))
+	s.expect("filter=age>100", FILTER, `^SELECT \* FROM "users" WHERE "age" > \$1$`, int64(100))
+	s.expect("filter=login<Phil", FILTER, `^SELECT \* FROM "users" WHERE "username" < \$1$`, "Phil")
 }
 
-func (s *TestSuite) TestFiltersGreaterThanOrEqualTo() {
-	var users []User
-	ctx := gin.Context{}
-	ctx.Request = &http.Request{
-		URL: &url.URL{
-			RawQuery: "filter=id>=99",
-		},
-	}
-
-	s.mock.ExpectQuery(`^SELECT \* FROM "users" WHERE "Id" >= \$1`).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "Username", "FullName", "Email", "Password"}))
-	err := s.db.Model(&User{}).Scopes(FilterByQuery(&ctx, FILTER)).Find(&users).Error
-	s.NoError(err)
+func (s *TestSuite) TestFilterTypedValues() {
+	s.expect("filter=active:true", FILTER, `^SELECT \* FROM "users" WHERE "active" = \$1$`, true)
+	s.expect("filter=group_id:7", FILTER, `^SELECT \* FROM "users" WHERE "group_id" = \$1$`, uint64(7))
 }
 
-// TestFiltersSearchable is a test suite for searchable filters functionality.
-func (s *TestSuite) TestFiltersSearchable() {
-	var users []User
-	ctx := gin.Context{}
-	ctx.Request = &http.Request{
-		URL: &url.URL{
-			RawQuery: "search=John",
-		},
-	}
-
-	s.mock.ExpectQuery(`^SELECT \* FROM "users" WHERE \(LOWER\(\$1\) LIKE \$2 OR LOWER\(\$3\) LIKE \$4\)$`).
-		WithArgs("Username", "%john%", "FullName", "%john%").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "Username", "FullName", "Email", "Password"}))
-	err := s.db.Model(&User{}).Scopes(FilterByQuery(&ctx, SEARCH)).Find(&users).Error
-	s.NoError(err)
+func (s *TestSuite) TestFilterSeveralConditions() {
+	s.expect("filter=login:sampleUser&filter=email:john@example.com", FILTER,
+		`^SELECT \* FROM "users" WHERE "username" = \$1 AND "email" = \$2$`,
+		"sampleUser", "john@example.com")
+	s.expect("filter=age:3,active:false,", FILTER,
+		`^SELECT \* FROM "users" WHERE "age" = \$1 AND "active" = \$2$`,
+		int64(3), false)
 }
 
-// TestFiltersPaginateOnly is a test for pagination functionality.
-func (s *TestSuite) TestFiltersPaginateOnly() {
-	var users []User
-	ctx := gin.Context{}
-	ctx.Request = &http.Request{
-		URL: &url.URL{
-			RawQuery: "page=2&per_page=10",
-		},
+func (s *TestSuite) TestFilterRefused() {
+	for _, q := range []string{
+		"filter=password:secret",    // column without filterable
+		"filter=Password:secret",    // field name, not a column
+		"filter=unknown:1",          // no such column
+		"filter=age:abc",            // not an int
+		"filter=group_id:-1",        // not a uint
+		"filter=active:maybe",       // not a bool
+		"filter=age~1",              // LIKE on a number
+		"filter=login",              // no operator
+		"filter=login:a,password:b", // one bad condition fails all
+		"filter=x login:a",          // not a column name
+	} {
+		s.refuse(q, FILTER)
 	}
-
-	s.mock.ExpectQuery(`^SELECT \* FROM "users" ORDER BY "id" DESC LIMIT \$1 OFFSET \$2$`).
-		WithArgs(10, 10).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "Username", "FullName", "Email", "Password"}))
-	err := s.db.Model(&User{}).Scopes(FilterByQuery(&ctx, ALL)).Find(&users).Error
-	s.NoError(err)
 }
 
-// TestFiltersOrderBy is a test for order by functionality.
-func (s *TestSuite) TestFiltersOrderBy() {
-	var users []User
-	ctx := gin.Context{}
-	ctx.Request = &http.Request{
-		URL: &url.URL{
-			RawQuery: "order_by=Email&order_direction=asc",
-		},
-	}
-
-	s.mock.ExpectQuery(`^SELECT \* FROM "users" ORDER BY "Email"$`).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "Username", "FullName", "Email", "Password"}))
-	err := s.db.Model(&User{}).Scopes(FilterByQuery(&ctx, ORDER_BY)).Find(&users).Error
-	s.NoError(err)
+func (s *TestSuite) TestNoFilterConfig() {
+	s.expect("filter=login:sampleUser", SEARCH, `^SELECT \* FROM "users"$`)
 }
 
-// TestFiltersAndSearcg is test for filtering and searching simultaneously.
-func (s *TestSuite) TestFiltersAndSearch() {
-	var users []User
-	ctx := gin.Context{}
-	ctx.Request = &http.Request{
-		URL: &url.URL{
-			RawQuery: "filter=login:sampleUser&search=John",
-		},
-	}
-
-	s.mock.ExpectQuery(`^SELECT \* FROM "users" WHERE \(LOWER\(\$1\) LIKE \$2 OR LOWER\(\$3\) LIKE \$4\) AND "Username" = \$5$`).
-		WithArgs("Username", "%john%", "FullName", "%john%", "sampleUser").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "Username", "FullName", "Email", "Password"}))
-
-	err := s.db.Model(&User{}).Scopes(FilterByQuery(&ctx, FILTER|SEARCH)).Find(&users).Error
-	s.NoError(err)
+func (s *TestSuite) TestSearch() {
+	// Only the searchable text columns; active is tagged searchable but is a bool.
+	s.expect("search=John", SEARCH,
+		`^SELECT \* FROM "users" WHERE \(LOWER\("username"\) LIKE \$1 OR LOWER\("name"\) LIKE \$2\)$`,
+		"%john%", "%john%")
 }
 
-// TestFiltersMultipleColumns is a test for filtering on multiple columns.
-func (s *TestSuite) TestFiltersMultipleColumns() {
-	var users []User
-	ctx := gin.Context{}
-	ctx.Request = &http.Request{
-		URL: &url.URL{
-			RawQuery: "filter=login:sampleUser&filter=Email:john@example.com",
-		},
+func (s *TestSuite) TestSearchAndFilter() {
+	s.expect("filter=login:sampleUser&search=John", FILTER|SEARCH,
+		`^SELECT \* FROM "users" WHERE \(LOWER\("username"\) LIKE \$1 OR LOWER\("name"\) LIKE \$2\) AND "username" = \$3$`,
+		"%john%", "%john%", "sampleUser")
+}
+
+func (s *TestSuite) TestPaginate() {
+	s.expect("page=2&page_size=10", ALL,
+		`^SELECT \* FROM "users" ORDER BY "id" DESC LIMIT \$1 OFFSET \$2$`, 10, 10)
+	s.expect("page_size=1000", PAGINATE, `^SELECT \* FROM "users" LIMIT \$1$`, 100)
+	s.expect("all=true", PAGINATE, `^SELECT \* FROM "users"$`)
+}
+
+func (s *TestSuite) TestPaginateRefused() {
+	s.refuse("page=abc", PAGINATE)
+	s.refuse("page=9999999999", PAGINATE)
+}
+
+func (s *TestSuite) TestOrderBy() {
+	s.expect("order_by=email&order_direction=asc", ORDER_BY, `^SELECT \* FROM "users" ORDER BY "email"$`)
+	s.expect("order_by=login", ORDER_BY, `^SELECT \* FROM "users" ORDER BY "username" DESC$`)
+	s.expect("order_by=created_at", ORDER_BY, `^SELECT \* FROM "users" ORDER BY "created_at" DESC$`)
+	s.expect("", ORDER_BY, `^SELECT \* FROM "users" ORDER BY "id" DESC$`)
+}
+
+func (s *TestSuite) TestOrderByRefused() {
+	for _, q := range []string{
+		"order_by=password",   // not sortable
+		"order_by=name",       // searchable only
+		"order_by=updated_at", // not tagged
+		"order_by=Email",      // not a column name
+		"order_by=1",          // not a column
+		"order_by=group",      // a relation
+		"order_by=email&order_direction=up",
+	} {
+		s.refuse(q, ORDER_BY)
 	}
+}
 
-	s.mock.ExpectQuery(`SELECT \* FROM "users" WHERE "Username" = \$1 AND "Email" = \$2$`).
-		WithArgs("sampleUser", "john@example.com").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "Username", "FullName", "Email", "Password"}))
-
-	err := s.db.Model(&User{}).Scopes(FilterByQuery(&ctx, FILTER)).Find(&users).Error
+func (s *TestSuite) TestColumnsOf() {
+	c, err := ColumnsOf(s.db, &User{})
 	s.NoError(err)
+	s.Equal([]string{"login", "name"}, c.Searchable)
+	s.Equal([]string{"active", "age", "email", "group_id", "login"}, c.Filterable)
+	s.Equal([]string{"active", "age", "created_at", "email", "group_id", "id", "login"}, c.Sortable)
 }
 
 func TestRunSuite(t *testing.T) {
